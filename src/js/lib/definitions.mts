@@ -1,15 +1,57 @@
+import GenerateContext from "./GenerateContext.mjs";
 import { csForEach, csMap, csWhere } from "./csUtil.mjs";
 
 class TSType {
-    public static isNotSupportedType(astType: CS.CppAst.CppType) {
+    public static isNotSupportedTypeForInterop(generateContext: GenerateContext, astType: CS.CppAst.CppType) {
+        while (
+            astType.TypeKind == CS.CppAst.CppTypeKind.Qualified ||
+            astType.TypeKind == CS.CppAst.CppTypeKind.Typedef
+        ) {
+            astType = this.getUnderlyingType(astType)
+        }
+        if (astType.TypeKind == CS.CppAst.CppTypeKind.Array) return true;
+        if (astType.TypeKind == CS.CppAst.CppTypeKind.Reference) {
+            let underlyingType = this.getUnderlyingType(astType)
+            if (underlyingType.TypeKind != CS.CppAst.CppTypeKind.Qualified) return true;
+            underlyingType = this.getUnderlyingType(underlyingType)
+            if (underlyingType.FullName != 'String') return true;
+        }
+        if (
+            astType.TypeKind == CS.CppAst.CppTypeKind.Pointer && 
+            this.getUnderlyingType(astType).TypeKind != CS.CppAst.CppTypeKind.StructOrClass
+        ) {
+            return true;
+        }
+        if (astType.TypeKind == CS.CppAst.CppTypeKind.StructOrClass) { 
+            // should be a pointer to class
+            return true; 
+        }
+        return this.isNotSupportedType(generateContext, astType);
+    }
+    public static isNotSupportedType(generateContext: GenerateContext, astType: CS.CppAst.CppType) {
+        let lastKind = null;
         while ([
             CS.CppAst.CppTypeKind.Array,
             CS.CppAst.CppTypeKind.Pointer,
             CS.CppAst.CppTypeKind.Qualified,
             CS.CppAst.CppTypeKind.Reference,
-        ].indexOf(astType.TypeKind) != -1) astType = this.getUnderlyingType(astType);
+            CS.CppAst.CppTypeKind.Typedef,
+        ].indexOf(astType.TypeKind) != -1) {
+            // double pointer is not supported
+            if (
+                (lastKind == CS.CppAst.CppTypeKind.Array || lastKind == CS.CppAst.CppTypeKind.Pointer) &&
+                (astType.TypeKind == CS.CppAst.CppTypeKind.Array || astType.TypeKind == CS.CppAst.CppTypeKind.Pointer)
+            ) return true;
+            lastKind = astType.TypeKind;
+            astType = this.getUnderlyingType(astType);
+        }
         if (astType.TypeKind == CS.CppAst.CppTypeKind.Unexposed) return true;
-        if (astType.TypeKind == CS.CppAst.CppTypeKind.StructOrClass) return TSClass.isNotSupportedClass(astType as CS.CppAst.CppClass);
+        if (astType.FullName.startsWith('std') && 
+            astType.FullName.indexOf('function') == -1 &&
+            astType.FullName.indexOf('string') == -1
+        ) return true;
+        if (astType.TypeKind == CS.CppAst.CppTypeKind.Function) return true;
+        if (astType.TypeKind == CS.CppAst.CppTypeKind.StructOrClass) return TSClass.isNotSupportedClass(generateContext, astType as CS.CppAst.CppClass);
         return false;
     }
     public static isNotSupportedTypeForBinding(type: TSType | CS.CppAst.CppType) {
@@ -29,16 +71,16 @@ class TSType {
                 // return `(${csMap(func.Parameters, (item) => {
                 //     return (new TSType(item.Type)).name
                 // }).join(', ')}) => ${new TSType(func.ReturnType).name}`
-                return `(...args: any[]) => ${new TSType(func.ReturnType).name}`
+                return `(...args: any[]) => ${new TSType(this.generateContext, func.ReturnType).name}`
 
-            case CS.CppAst.CppTypeKind.TemplateArgumentType: 
+            case CS.CppAst.CppTypeKind.TemplateArgumentType:
                 if ((this.astType as CS.CppAst.CppTemplateArgument).ArgAsType)
-                    return (new TSType((this.astType as CS.CppAst.CppTemplateArgument).ArgAsType)).name
+                    return (new TSType(this.generateContext, (this.astType as CS.CppAst.CppTemplateArgument).ArgAsType)).name
                 return cppName;
 
             case CS.CppAst.CppTypeKind.Enum: return 'number';
             case CS.CppAst.CppTypeKind.Array: return (this.elemType as TSType).name + '[]';
-            case CS.CppAst.CppTypeKind.Pointer: 
+            case CS.CppAst.CppTypeKind.Pointer:
                 const elemType = this.elemType as TSType;
                 if (elemType.cppName == 'void') return 'any';
                 return (elemType as TSType).name;
@@ -47,9 +89,14 @@ class TSType {
             case CS.CppAst.CppTypeKind.Typedef:
                 if (this.elemType?.astType.TypeKind == CS.CppAst.CppTypeKind.Primitive) {
                     cppName = this.elemType.cppName;
-                } else return cppName;
-                
+                } else {
+                    if (cppName == 'std::string')
+                        return 'string'
+                    return cppName;
+                }
+
             case CS.CppAst.CppTypeKind.Primitive:
+                if (cppName.startsWith('unsigned ')) cppName = cppName.replace('unsigned ', '');
                 switch (cppName) {
                     case 'bool': return 'boolean';
                     case 'int': return 'number';
@@ -73,40 +120,43 @@ class TSType {
                     case 'double': return 'number';
                     case 'void': return 'void';
                     case 'char': return 'string';
+                    case 'wchar': return 'string';
                     case 'wchar_t': return 'string';
                     case 'char16_t': return 'string';
                     case 'char32_t': return 'string';
                     case 'size_t': return 'number';
                     case 'long long': return 'bigint';
-                    case 'unsigned long long': return 'bigint';
                     default: throw new Error(`unknown primitive type ${this.cppName}`);
                 }
             case CS.CppAst.CppTypeKind.StructOrClass:
-                // String will be handled as a js string
-                if (cppName == 'String') return 'string';
+                if (this.generateContext.specialTSNames[cppName]) return this.generateContext.specialTSNames[cppName];
                 const cls = this.astType as CS.CppAst.CppClass;
                 if (cls.TemplateKind == CS.CppAst.CppTemplateKind.NormalClass) {
                     return cppName
                 }
                 // std::function will be handled as a jsfunction
                 if (cls.FullParentName == 'std' && cls.Name == 'function') {
-                    return new TSType(cls.TemplateSpecializedArguments.get_Item(0)).name
+                    return new TSType(this.generateContext, cls.TemplateSpecializedArguments.get_Item(0)).name
                 }
                 return `any`
 
-            default: 
+            default:
                 return cppName
         }
     }
     public readonly cppName: string;
     public readonly isPrimitive: boolean;
     public readonly elemType: TSType | undefined;
-    
-    constructor(public readonly astType: CS.CppAst.CppType) {
+
+    constructor(
+        private readonly generateContext: GenerateContext,
+        public readonly astType: CS.CppAst.CppType
+    ) {
         this.cppName = astType.FullName;
         // It may be a bug of cppast.net
-        if (this.cppName.indexOf('std::function') != -1 && this.cppName.indexOf('(*)') != -1)
+        if (this.cppName.indexOf('std::function') != -1 && this.cppName.indexOf('(*)') != -1) {
             this.cppName = this.cppName.replace('(*)', '');
+        }
 
         this.astType = astType;
         this.isPrimitive = astType.TypeKind == CS.CppAst.CppTypeKind.Primitive;
@@ -117,7 +167,7 @@ class TSType {
             CS.CppAst.CppTypeKind.Reference,
             CS.CppAst.CppTypeKind.Typedef,
         ].indexOf(astType.TypeKind) != -1) {
-            this.elemType = new TSType(TSType.getUnderlyingType(astType));
+            this.elemType = new TSType(this.generateContext, TSType.getUnderlyingType(astType));
         }
     }
 
@@ -125,35 +175,105 @@ class TSType {
         return this.elemType ? this.elemType.rawType : this;
     }
 }
+
 class TSVariable {
-    public static isNotSupportedVariable(astField: CS.CppAst.CppField) {
+    public static isNotSupportedVariable(generateContext: GenerateContext, astField: CS.CppAst.CppField) {
+        let astType = astField.Type;
         if (astField.Visibility != CS.CppAst.CppVisibility.Public) return true;
-        if (astField.IsBitField && astField.IsAnonymous) return true;
+        if (astField.IsBitField || astField.IsAnonymous) return true;
+        if (TSType.isNotSupportedTypeForInterop(generateContext, astType)) return true;
+        if (generateContext.excludes.members.filter((fullName) => {
+            const tempSplit = fullName.split('::');
+            const ns = tempSplit.slice(0, -1).join('::');
+            const name = tempSplit[tempSplit.length - 1];
+
+            return astField.Name == name && astField.FullParentName == ns;
+        }).length) return true;
+        return false;
+    }
+    public static isNotSupportedParameter(generateContext: GenerateContext, astParam: CS.CppAst.CppParameter) {
+        if (TSType.isNotSupportedTypeForInterop(generateContext, astParam.Type)) return true;
         return false;
     }
     public readonly name: string;
     public readonly isStatic: boolean;
     public readonly isReadOnly: boolean;
     public readonly type: TSType;
-    public readonly defaultValue: string = '';
-    public readonly defaultValueKind: CS.CppAst.CppExpressionKind = CS.CppAst.CppExpressionKind.Unexposed;
-    constructor(public readonly astField: CS.CppAst.CppField | CS.CppAst.CppParameter, paramIndex: number = 0) {
+    public readonly defaultExpressionCpp: string = '';
+    public readonly defaultExpressionTS: string = '';
+    constructor(
+        private readonly generateContext: GenerateContext,
+        public readonly astField: CS.CppAst.CppField | CS.CppAst.CppParameter,
+        paramIndex: number = 0
+    ) {
         if (astField instanceof CS.CppAst.CppParameter) {
             const astParam = astField;
             this.name = astParam.Name || ('arg' + paramIndex);
             this.isStatic = false
             this.isReadOnly = astParam.Type.TypeKind == CS.CppAst.CppTypeKind.Qualified;
-            this.type = new TSType(astParam.Type);
+            this.type = new TSType(this.generateContext, astParam.Type);
             if (astParam.InitExpression) {
-                this.defaultValueKind = astParam.InitExpression.Kind;
-                this.defaultValue = astParam.InitExpression.toString();
+                // const initValueInStr = astParam.InitValue == null ? astParam.InitExpression.toString() : astParam.InitValue.toString();
+                const initValueInStr = astParam.InitValue == null ? astParam.InitExpression.toString() : astParam.InitValue.toString();
+
+                // if (this.name == 'authLen') {
+                // if (this.name == 'config') {
+                //     console.log(this.name, 'astParam.InitExpression.Kind', astParam.InitExpression.Kind, astParam.InitExpression.toString())
+                // }
+                // console.log(astParam.Name, astParam.InitExpression.Kind, astParam.InitExpression.toString(), astParam.InitValue?.toString())
+                // default value in ts
+                switch (astParam.InitExpression.Kind) {
+                    case CS.CppAst.CppExpressionKind.DeclRef:
+                    case CS.CppAst.CppExpressionKind.Call:
+                        if (astParam.InitValue != null) {
+                            this.defaultExpressionTS = initValueInStr;
+
+                        } else {
+                            // todo need namespace finding
+                            // const raw = astParam.InitExpression as CS.CppAst.CppRawExpression;
+                            // this.defaultExpressionTS = 'SC.' + initValueInStr.split('::').join('.');
+                            this.defaultExpressionTS = '';
+                        }
+                        break;
+                    default:
+                        this.defaultExpressionTS = initValueInStr;
+                        break;
+                }
+                if (this.defaultExpressionTS == 'nullptr') this.defaultExpressionTS = 'null';
+
+                // default value in cpp
+                if (!this.defaultExpressionTS) {
+                    this.defaultExpressionCpp = '';
+
+                } else if (this.type.astType.TypeKind == CS.CppAst.CppTypeKind.Enum && astParam.InitValue) {
+                    this.defaultExpressionCpp = `(${this.type.astType.FullName})${astParam.InitValue}`;
+
+                } else if (this.type.rawType.name == "boolean" && astParam.InitValue) {
+                    this.defaultExpressionCpp = initValueInStr == '0' ? 'false' : 'true';
+                    
+                } else if (
+                    astParam.InitExpression.toString().match(/\.\d*f$/)
+                ) {
+                    this.defaultExpressionCpp = astParam.InitExpression.toString();
+
+                } else if (
+                    !this.type.isPrimitive &&
+                    this.type.astType.TypeKind == CS.CppAst.CppTypeKind.Reference &&
+                    astParam.InitExpression.Kind == CS.CppAst.CppExpressionKind.Unexposed
+                ) {
+                    // for creating const String& by ""
+                    this.defaultExpressionCpp = `${this.type.rawType.cppName}(${initValueInStr})`;
+
+                } else {
+                    this.defaultExpressionCpp = initValueInStr;
+                }
             }
 
         } else if (astField instanceof CS.CppAst.CppField) {
             this.name = astField.Name;
             this.isStatic = astField.StorageQualifier == CS.CppAst.CppStorageQualifier.Static;
             this.isReadOnly = astField.Type.TypeKind == CS.CppAst.CppTypeKind.Qualified;
-            this.type = new TSType(astField.Type);
+            this.type = new TSType(this.generateContext, astField.Type);
 
         } else {
             throw new Error("not supported");
@@ -161,13 +281,22 @@ class TSVariable {
     }
 }
 class TSOverload {
-    public static isNotSupportedFunction(astFunction: CS.CppAst.CppFunction) {
+    public static isNotSupportedFunction(generateContext: GenerateContext, astFunction: CS.CppAst.CppFunction) {
         if (astFunction.Visibility != CS.CppAst.CppVisibility.Public) return true;
-        if (TSType.isNotSupportedType(astFunction.ReturnType)) return true;
+        if (TSType.isNotSupportedTypeForInterop(generateContext, astFunction.ReturnType)) return true;
         if (astFunction.Flags & CS.CppAst.CppFunctionFlags.Variadic) return true;
+        if (astFunction.Flags & CS.CppAst.CppFunctionFlags.Deleted) return true;
+        if (astFunction.TemplateParameters.Count > 0) return true;
         if (csWhere(astFunction.Parameters, (param: CS.CppAst.CppParameter) => {
-            return TSType.isNotSupportedType(param.Type)// || param.Type.FullName == 'const char*'
+            return TSType.isNotSupportedTypeForInterop(generateContext, param.Type)
         })) return true;
+        if (generateContext.excludes.members.filter((fullName) => {
+            const tempSplit = fullName.split('::');
+            const ns = tempSplit.slice(0, -1).join('::');
+            const name = tempSplit[tempSplit.length - 1];
+
+            return astFunction.Name == name && astFunction.FullParentName == ns;
+        }).length) return true;
         return false;
     }
     public readonly returnType: TSType;
@@ -175,15 +304,19 @@ class TSOverload {
     public readonly name: string;
     public readonly isStatic: boolean;
     public readonly isConst: boolean;
-    constructor(public readonly astFunction: CS.CppAst.CppFunction) {
-        this.returnType = new TSType(astFunction.ReturnType);
+    constructor(
+        private readonly generateContext: GenerateContext,
+        public readonly astFunction: CS.CppAst.CppFunction
+    ) {
+        this.returnType = new TSType(this.generateContext, astFunction.ReturnType);
         this.name = astFunction.Name;
         this.isStatic = astFunction.IsStatic;
         this.isConst = astFunction.IsConst;
+
         csForEach(
             astFunction.Parameters,
             (astParam: CS.CppAst.CppParameter, index: number) => {
-                this.params.push(new TSVariable(astParam, index));
+                this.params.push(new TSVariable(this.generateContext, astParam, index));
             }
         )
     }
@@ -191,28 +324,37 @@ class TSOverload {
 class TSFunction {
     public readonly overloads: TSOverload[] = [];
 
-    constructor(public readonly name: string, public readonly isStatic: boolean) { }
+    constructor(
+        private readonly generateContext: GenerateContext,
+        public readonly name: string, public readonly isStatic: boolean, public readonly index: number
+    ) { }
 
     public addFunction(func: TSOverload | CS.CppAst.CppFunction) {
         if (func instanceof CS.CppAst.CppFunction) {
-            func = new TSOverload(func);
+            func = new TSOverload(this.generateContext, func);
         }
         this.overloads.push(func);
     }
 }
 
 class TSClass {
-    public static isNotSupportedClass(astClass: CS.CppAst.CppClass) {
+    public static isNotSupportedClass(generateContext: GenerateContext, astClass: CS.CppAst.CppClass) {
+        if (astClass.Functions.Count == 0 && astClass.Fields.Count ==0 && astClass.Constructors.Count == 0) return true;
+        if (astClass.Visibility > CS.CppAst.CppVisibility.Public) return true;
         if (astClass.IsAnonymous) return true;
         if (astClass.TemplateKind == CS.CppAst.CppTemplateKind.PartialTemplateClass) return true;
         if (astClass.TemplateKind == CS.CppAst.CppTemplateKind.TemplateClass) return true;
         if (astClass.TemplateKind == CS.CppAst.CppTemplateKind.TemplateSpecializedClass) {
-            return !astClass.FullName.includes('std::function');
+            return !astClass.FullName.startsWith('std::function');
         }
+        if (generateContext.excludes.types.indexOf(astClass.FullName) != -1) return true;
+        if (generateContext.excludes.namespaces.filter((ns) => {
+            if (astClass.FullName.indexOf(ns) != -1) return true;
+        }).length) return true;
         return false;
     }
-    public readonly fullname: string;
-    public readonly baseTypeFullName: string;
+    public readonly cppFullName: string;
+    public readonly baseTypeCppFullName: string;
     public readonly functions: TSFunction[] = [];
     public readonly ctor: TSFunction;
     public readonly fields: TSVariable[] = [];
@@ -221,41 +363,57 @@ class TSClass {
             (overload) => overload.name == name && overload.isStatic == isStatic
         );
         if (!overload) {
-            overload = new TSFunction(name, isStatic);
+            overload = new TSFunction(this.generateContext, name, isStatic, this.functions.length);
             this.functions.push(overload);
         }
         return overload;
     }
-    constructor(public readonly astClass: CS.CppAst.CppClass) {
+    constructor(
+        private readonly generateContext: GenerateContext,
+        public readonly astClass: CS.CppAst.CppClass
+    ) {
         // if (astClass.FullName.endsWith("::")) console.log(astClass.IsAnonymous, astClass.FullName)
-        this.fullname = astClass.FullName;
-        this.baseTypeFullName = astClass.BaseTypes.Count > 0 ? astClass.BaseTypes.get_Item(0).Type.FullName : "";
+        this.cppFullName = astClass.FullName;
+        this.baseTypeCppFullName = astClass.BaseTypes.Count > 0 ? astClass.BaseTypes.get_Item(0).Type.FullName : "";
 
-        this.ctor = new TSFunction('constructor', false);
+        this.ctor = new TSFunction(this.generateContext, 'constructor', false, 0);
         if (!this.astClass.IsAbstract)
             csForEach(this.astClass.Constructors, (astFunction: CS.CppAst.CppFunction) => {
-                if (TSOverload.isNotSupportedFunction(astFunction)) return;
+                if (TSOverload.isNotSupportedFunction(this.generateContext, astFunction)) return;
                 this.ctor.addFunction(astFunction);
             })
+    }
+    public addAllMember() {
+        csForEach(this.astClass.Functions, (astFunction: CS.CppAst.CppFunction) => {
+            if (TSOverload.isNotSupportedFunction(this.generateContext, astFunction)) return;
+            const overload = this.findOrAddOverload(astFunction.Name, astFunction.IsStatic);
+            overload.addFunction(astFunction);
+        });
+        csForEach(this.astClass.Fields, (astField: CS.CppAst.CppField) => {
+            if (TSVariable.isNotSupportedVariable(this.generateContext, astField)) return;
+            this.fields.push(new TSVariable(this.generateContext, astField));
+        });
     }
     public addMember(signature: string) {
         const sign = signature.split(':').pop();
 
         if (sign == this.astClass.Name) {
+            // ignore constructor
 
         } else if (sign == '~' + this.astClass.Name) {
+            // ignore destructor
 
         } else {
             csForEach(this.astClass.Functions, (astFunction: CS.CppAst.CppFunction) => {
                 if (astFunction.Name != sign) return;
-                if (TSOverload.isNotSupportedFunction(astFunction)) return;
+                if (TSOverload.isNotSupportedFunction(this.generateContext, astFunction)) return;
                 const overload = this.findOrAddOverload(astFunction.Name, astFunction.IsStatic);
                 overload.addFunction(astFunction);
             });
             csForEach(this.astClass.Fields, (astField: CS.CppAst.CppField) => {
                 if (astField.Name != sign) return;
-                if (TSVariable.isNotSupportedVariable(astField)) return;
-                this.fields.push(new TSVariable(astField));
+                if (TSVariable.isNotSupportedVariable(this.generateContext, astField)) return;
+                this.fields.push(new TSVariable(this.generateContext, astField));
             });
         }
     }

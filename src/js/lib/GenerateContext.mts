@@ -1,31 +1,52 @@
 import { csForEach } from "./csUtil.mjs";
 import { TSClass } from "./definitions.mjs";
 
-export default class UsageCollector {
+export interface GenerateBlackList {
+    namespaces: string[]
+    types: string[]
+    members: string[]
+}
+
+export default class GenerateContext {
     private readonly usedCls: Map<CS.CppAst.CppClass, TSClass> = new Map();
-    constructor(private readonly compilation: CS.CppAst.CppCompilation) {
+    public readonly excludes: GenerateBlackList;
+    public readonly specialTSNames: { [key: string]: string };
+    constructor(
+        private readonly compilation: CS.CppAst.CppCompilation,
+        excludes?: GenerateBlackList,
+        specialTSNames?: { [key: string]: string }
+    ) {
+        this.excludes = excludes || { types: [], members: [], namespaces: [] };
+        this.excludes.types = this.excludes.types || [];
+        this.excludes.members = this.excludes.members || [];
+        this.excludes.namespaces = this.excludes.namespaces || [];
+        this.specialTSNames = specialTSNames || {};
     }
     public findAstClass(clsFullName: string): CS.CppAst.CppClass | null {
         const classNamePart = clsFullName.split('::');
-        let currentNamespace: CS.CppAst.CppCompilation | CS.CppAst.CppNamespace | CS.CppAst.CppClass = this.compilation;
         let result = null;
 
-        while (classNamePart.length != 1) {
-            const nsOrCls = classNamePart.shift();
-            let ns: CS.CppAst.CppCompilation | CS.CppAst.CppNamespace | CS.CppAst.CppClass | null = null;
+        let currentNamespace: CS.CppAst.CppCompilation | CS.CppAst.CppNamespace | CS.CppAst.CppClass = this.compilation;
+        let nsNameOrClsName = classNamePart.shift();
+        while (classNamePart.length != 0) {
+            let matchedNamespace: CS.CppAst.CppCompilation | CS.CppAst.CppNamespace | CS.CppAst.CppClass | null = null;
             if (currentNamespace.Namespaces) csForEach(currentNamespace.Namespaces, (item) => {
-                if (item.Name == nsOrCls) ns = item;
+                if (item.Name == nsNameOrClsName) matchedNamespace = item;
             });
-            if (!ns && currentNamespace.Classes) csForEach(currentNamespace.Classes, (cls) => {
-                if (cls.Name == nsOrCls) ns = cls;
+            if (!matchedNamespace && currentNamespace.Classes) csForEach(currentNamespace.Classes, (cls) => {
+                if (cls.Name == nsNameOrClsName) matchedNamespace = cls;
             });
 
-            if (!ns) return null;
-            currentNamespace = ns;
+            if (!matchedNamespace) {
+                console.warn(`find ${nsNameOrClsName} failed`)
+                return null;
+            }
+            currentNamespace = matchedNamespace;
+            nsNameOrClsName = classNamePart.shift();
         }
 
         csForEach(currentNamespace.Classes, (cls) => {
-            if (cls.FullName == clsFullName) result = cls;
+            if (cls.Name == nsNameOrClsName) result = cls;
         });
         return result;
     }
@@ -46,15 +67,14 @@ export default class UsageCollector {
     }
 
     protected addRefUsage(name: string) {
-        if (name == "String") return;
         const astClass = this.findAstClass(name);
 
         if (!astClass) return;//console.warn(`can't find class ${clsName} in compilation`);;
         let tsCls;
         if (!this.usedCls.has(astClass)) {
             // console.log(astClass.FullName, DTSClass.isNotSupportedClass(astClass));
-            if (TSClass.isNotSupportedClass(astClass)) return;
-            tsCls = new TSClass(astClass)
+            if (TSClass.isNotSupportedClass(this, astClass)) return;
+            tsCls = new TSClass(this, astClass)
             this.usedCls.set(astClass, tsCls);
             return tsCls
 
@@ -69,7 +89,7 @@ export default class UsageCollector {
     }
     public expandCurrentUsage() {
         for (const cls of this.usedCls.values()) {
-            cls.baseTypeFullName && this.addRefUsage(cls.baseTypeFullName);
+            cls.baseTypeCppFullName && this.addRefUsage(cls.baseTypeCppFullName);
             cls.ctor.overloads.forEach((func) => {
                 const type = func.returnType.rawType;
                 if (!type.isPrimitive) this.addRefUsage(type.cppName)
@@ -109,15 +129,40 @@ export default class UsageCollector {
     }
     public addBaseUsage(signature: string) {
         const name = signature.split('::').slice(0, -1).join('::');
-        if (name == 'String') return;
         const astClass = this.findAstClass(name);
 
-        if (!astClass) return;//console.warn(`can't find class ${clsName} in compilation`);;
+        if (!astClass) {
+            console.warn(`can't find class ${name} in compilation`);
+            return
+        }
         if (!this.usedCls.has(astClass)) {
-            if (TSClass.isNotSupportedClass(astClass)) return;
-            this.usedCls.set(astClass, new TSClass(astClass));
+            if (TSClass.isNotSupportedClass(this, astClass)) return;
+            this.usedCls.set(astClass, new TSClass(this, astClass));
         }
         const cls = this.usedCls.get(astClass) as TSClass;
-        cls.addMember(signature);
+        if (signature.endsWith("::*")) {
+            cls.addAllMember();
+        } else {
+            cls.addMember(signature);
+        }
+    }
+
+    public findAllClass() {
+        this.iterateNamespace(this.compilation)
+    }
+    private iterateNamespace(namespace: CS.CppAst.CppCompilation | CS.CppAst.CppNamespace | CS.CppAst.CppClass) {
+        if (namespace.Classes) csForEach(namespace.Classes, (astClass: CS.CppAst.CppClass) => {
+            if (!this.usedCls.has(astClass)) {
+                if (TSClass.isNotSupportedClass(this, astClass)) return;
+                const tsCls = new TSClass(this, astClass)
+                this.usedCls.set(astClass, tsCls);
+                tsCls.addAllMember();
+            }
+
+            this.iterateNamespace(astClass);
+        });
+        if (!(namespace instanceof CS.CppAst.CppClass) && namespace.Namespaces) csForEach(namespace.Namespaces, (item) => {
+            this.iterateNamespace(item)
+        });
     }
 }

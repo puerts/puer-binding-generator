@@ -7,7 +7,7 @@ const { cp, mkdir, rm, mv, exec } = require('@puerts/shell-util')
     mkdir('-p', `${__dirname}/../dist/`)
     rm('-rf', `${__dirname}/../dist/cppast.net`);
     cp('-r', 
-        `${__dirname}/../src/cs/PuertsCppGenerator/bin/Debug/net7.0/win-x64`,
+        `${__dirname}/../src/cs/PuertsCppGenerator/bin/Debug/net8.0/win-x64`,
         `${__dirname}/../dist/`
     )
     mv( 

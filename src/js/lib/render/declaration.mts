@@ -1,8 +1,8 @@
 import { TSClass, TSType } from "../definitions.mjs";
-import UsageCollector from "../UsageCollector.mjs";
+import GenerateContext from "../GenerateContext.mjs";
 
 export default function renderDeclaration(
-    usageCollector: UsageCollector
+    usageCollector: GenerateContext
 ) {
     let ret = 'declare namespace SC {\n\n'
 
@@ -16,40 +16,45 @@ export default function renderDeclaration(
     return ret + "\n\n}";
 }
 
+function addParamPrefix(type: TSType) {
+    if (type.name == 'va_list')
+        return '...$'
+    return '$' // prevent name to be JS keyword
+}
 function renderTypeName(type: TSType) {
     const name = type.name;
-    return name;
-}
-function renderDefaultValue(defaultValue: string, defaultValueKind: CS.CppAst.CppExpressionKind) {
-    
-    switch(defaultValueKind) {
-        case CS.CppAst.CppExpressionKind.DeclRef:
-            return 'SC.' + defaultValue.split('::').join('.');
-        case CS.CppAst.CppExpressionKind.FloatingLiteral:
-            return defaultValue.replace(/f$/, '');
-        default:
-            return defaultValue;
-    }
+    if (name == 'va_list')
+        return 'any[]'
+    return cppFullNameToTsFullName(name);
 }
 
-function renderClass(cls: TSClass, usageCollector: UsageCollector) {
+function renderClass(cls: TSClass, usageCollector: GenerateContext) {
+    const debug = cls.cppFullName.indexOf('PepperPerMessageEncrypter') > -1;
     let ret = ''
     let baseClsStr = '';
-    if (cls.baseTypeFullName) {
-        const baseAstCls = usageCollector.findAstClass(cls.baseTypeFullName);
+    if (cls.baseTypeCppFullName) {
+        const baseAstCls = usageCollector.findAstClass(cls.baseTypeCppFullName);
         if (baseAstCls) {
             if (baseAstCls.IsAbstract && baseAstCls.Destructors.Count == 0)
-                baseClsStr = ' implements ' + cls.baseTypeFullName;
-            else 
-                baseClsStr = ' extends ' + cls.baseTypeFullName;
+                baseClsStr = ' implements ' + cppFullNameToTsFullName(cls.baseTypeCppFullName);
+            else if (baseAstCls.TemplateKind == CS.CppAst.CppTemplateKind.NormalClass)
+                baseClsStr = ' extends ' + cppFullNameToTsFullName(cls.baseTypeCppFullName);
+            // todo support non normal class
         }
     }
-    ret += `class ${cls.fullname}${baseClsStr} { \n`;
+    const nsAndClsName = cppFullNameToTsNSAndClsName(cls.cppFullName)
+    if (nsAndClsName.namespaces.length != 0) {
+        ret += nsAndClsName.namespaces.map((ns) => {
+            return `namespace ${ns} {\n`
+        }).join('\n');
+    }
+    ret += `class ${nsAndClsName.className}${baseClsStr} { \n`;
 
     if (cls.ctor.overloads.length != 0) {
         ret += cls.ctor.overloads.map((overload) => {
             return `    constructor(${overload.params.map((param) => {
-                return `${param.name}: ${renderTypeName(param.type)}${param.defaultValue ? ' = ' + renderDefaultValue(param.defaultValue, param.defaultValueKind) : ''}`
+                // debug && console.log(param.name, 'ctor default param:', param.defaultExpressionTS)
+                return `${addParamPrefix(param.type)}${param.name}: ${renderTypeName(param.type)}${param.defaultExpressionTS ? ' = ' + param.defaultExpressionTS : ''}`
             }).join(', ')});`
         }).join('\n');
         ret += '\n\n';
@@ -57,9 +62,11 @@ function renderClass(cls: TSClass, usageCollector: UsageCollector) {
 
     if (cls.functions.length != 0) {
         ret += cls.functions.map((func) => {
+            // debug && console.log('func:', func.name)
             return func.overloads.map((overload) => {
-                return `    public ${overload.isStatic ? 'static ': ''}${overload.name}(${overload.params.map((param) => {
-                    return `${param.name}: ${renderTypeName(param.type)}${param.defaultValue ? ' = ' + renderDefaultValue(param.defaultValue, param.defaultValueKind) : ''}`
+                return `    public ${overload.isStatic ? 'static ' : ''}${fixInvalidMemberName(overload.name)}(${overload.params.map((param) => {
+                    // debug && console.log(param.name, 'fn default param:', param.defaultExpressionTS)
+                    return `${addParamPrefix(param.type)}${param.name}: ${renderTypeName(param.type)}${param.defaultExpressionTS ? ' = ' + param.defaultExpressionTS : ''}`
                 }).join(', ')}) : ${renderTypeName(overload.returnType)};`
             }).join('\n');
         }).join('\n\n');
@@ -68,11 +75,36 @@ function renderClass(cls: TSClass, usageCollector: UsageCollector) {
 
     if (cls.fields.length != 0) {
         ret += cls.fields.map((field) => {
-            return `    public ${field.isStatic ? 'static ': ''}${field.name}: ${renderTypeName(field.type)};`
+            // debug && console.log('field:', field.name)
+            return `    public ${field.isStatic ? 'static ' : ''}${fixInvalidMemberName(field.name)}: ${renderTypeName(field.type)};`
         }).join('\n\n');
         ret += '\n\n';
     }
     ret += '    [Symbol.dispose](): any; \n';
     ret += '\n}'
+    if (nsAndClsName.namespaces.length != 0) {
+        ret += nsAndClsName.namespaces.map((ns) => {
+            return `\n}`
+        }).join('\n');
+    }
     return ret
+}
+
+function fixInvalidMemberName(name: string) {
+    if (name.match(/[\=\*\+\-\/\<\>\s\[\]]/g))
+        return `['${name}']`
+    return name;
+}
+function cppFullNameToTsFullName(name: string) {
+    return name.replace(/::/g, '.')
+}
+function cppFullNameToTsNSAndClsName(name: string) {
+    if (name.indexOf('::') == -1) {
+        return { namespaces: [], className: name };
+
+    } else {
+        const parts = name.split('::');
+        return { namespaces: parts.slice(0, parts.length - 1), className: parts[parts.length - 1] };
+    }
+
 }

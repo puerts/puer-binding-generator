@@ -1,10 +1,9 @@
 import { TSClass, TSType, TSVariable } from "../definitions.mjs";
-import UsageCollector from "../UsageCollector.mjs";
+import GenerateContext from "../GenerateContext.mjs";
 
 function renderBinding(
-    usageExpander: UsageCollector,
-    BindingConfig: any,
-    bindingFunctionName: string
+    usageExpander: GenerateContext,
+    BindingConfig: any
 ) {
     const allClsEnum = usageExpander.getAllUsedCls();
     const allCls = [];
@@ -17,50 +16,65 @@ function renderBinding(
     return `
 #pragma once
 #include "Puerh.h"
+${(BindingConfig.contentFix?.bindingPrefixHeader || []).map((headerPath: string) => {
+    return `#include "${headerPath}"`
+})}
 ${(function () {
             const includePaths = BindingConfig.includePaths
 
-            return allHeaders.map((header) => {
-                let converted = false;
-                header = header.replace(/\\/g, '/');
-                includePaths.forEach((includePath: string) => {
-                    if (header.startsWith(includePath) && !converted) {
-                        header = header.replace(includePath, '')
-                        if (header.startsWith('/')) header = header.slice(1)
-                        converted = true;
-                    }
+            return allHeaders
+                .map((header) => {
+                    let converted = false;
+                    header = header.replace(/\\/g, '/');
+                    includePaths.forEach((includePath: string) => {
+                        if (header.startsWith(includePath) && !converted) {
+                            header = header.replace(includePath, '')
+                            if (header.startsWith('/')) header = header.slice(1)
+                            converted = true;
+                        }
+                    })
+                    return `#include "${header}"`
                 })
-                return `#include "${header}"`
-            }).join('\n')
+                .filter((val, index, arr) => {
+                    // todo
+                    // if (val.startsWith('#include "C:')) return false;
+                    // if (val.startsWith('#include "OpenGL')) return false;
+                    // if (val.startsWith('#include "scAsset')) return false;
+                    return arr.indexOf(val) == index;
+                })
+                .join('\n')
         })()}
 ${allCls.map((cls) => {
-    return renderClassDeclare(cls) + renderClassOverloadWithDefaultValue(cls)
-}).join('')}
-static void ${bindingFunctionName}() {
+            return renderClassDeclare(cls, BindingConfig.bindingManually?.fullnames) + renderClassOverloadWithDefaultValue(cls)
+        }).join('')}
+static void ${BindingConfig.output?.bindingFunctionName || 'ALL_PUER_BINDING'}() {
     ${allCls.map((cls) => {
-            return renderClassBinding(cls)
+            return renderClassBinding(cls, BindingConfig.bindingManually?.fullnames)
         }).join('')}
 }
     `
 }
 
-function renderDefaultValue(param: TSVariable, prefix: string = '') {
-    if (param.defaultValue) {
-        if (
-            !param.type.isPrimitive && 
-            param.type.astType.TypeKind == CS.CppAst.CppTypeKind.Reference && 
-            param.defaultValueKind == CS.CppAst.CppExpressionKind.Unexposed
-        ) {
-            // for "" to const String&
-            return prefix + `${param.type.rawType.cppName}(${param.defaultValue})`
-        }
-        return prefix + param.defaultValue
-    }
-    return '';
+function renderClassDeclare(cls: TSClass, bindingManuallyByFullName: string[] = []) {
+    if (bindingManuallyByFullName.indexOf(cls.cppFullName) != -1) return '';
+    return `\nUsingCppType(${cls.cppFullName})`
 }
+function renderDefaultValues(params: TSVariable[]) {
+    let stillHasDefault = true;
+    return params
+        .map((p) => p)
+        .reverse()
+        .map((param) => {
+            if (stillHasDefault && param.defaultExpressionCpp) {
+                return `, ${param.defaultExpressionCpp}`
+            }
+            stillHasDefault = false;
+            return '';
+        })
+        .reverse()
+        .filter(str => str)
+        .join('')
 
-function renderClassDeclare(cls: TSClass) {
-    return `\nUsingCppType(${cls.fullname})`
 }
 function renderClassOverloadWithDefaultValue(cls: TSClass) {
     let ret = '';
@@ -78,27 +92,27 @@ function renderClassOverloadWithDefaultValue(cls: TSClass) {
     //         }).filter(str => str).join('')})\n`
     //     })
     // }
-    cls.functions.forEach((overload) => {
-        if (overload.overloads.length > 1) {
-            ret += `\nDeclOverloads(${cls.fullname}_${overload.name})`
-            overload.overloads.forEach((overload) => {
-                const self = overload.isStatic ? "(*)" : `(${cls.fullname}::*)`
+    cls.functions.forEach((func) => {
+        if (func.overloads.length > 1) {
+            ret += `\nDeclOverloads(${cls.cppFullName.replace(/::/g, "_")}_${func.index})`
+            func.overloads.forEach((overload) => {
+                const self = overload.isStatic ? "(*)" : `(${cls.cppFullName}::*)`
                 const methodSign = `${overload.returnType.cppName}${self}(${overload.params.map(param => param.type.cppName).join(', ')})${overload.isConst ? ' const' : ''}`;
-                ret += `\nDeclOverload(${cls.fullname}_${overload.name}, ${methodSign}, &${cls.fullname}::${overload.name}${overload.params
-                    .map(param => renderDefaultValue(param, ', ')).filter(str => str).join('')})`
+                ret += `\nDeclOverload(${cls.cppFullName.replace(/::/g, "_")}_${func.index}, ${methodSign}, &${cls.cppFullName}::${overload.name}${renderDefaultValues(overload.params)})`
             })
         }
     });
 
     return ret;
 }
-function renderClassBinding(cls: TSClass) {
+function renderClassBinding(cls: TSClass, bindingManuallyByFullName: string[] = []) {
+    if (bindingManuallyByFullName.indexOf(cls.cppFullName) != -1) return '';
     if (cls.astClass.IsAbstract && cls.astClass.Destructors.Count == 0) return '';
 
     let res = `
-PUERTS_NAMESPACE::DefineClass<${cls.fullname}>()\n`
-    if (cls.baseTypeFullName) {
-        res += `    .Extends<${cls.baseTypeFullName}>()\n`
+PUERTS_NAMESPACE::DefineClass<${cls.cppFullName}>()\n`
+    if (cls.baseTypeCppFullName) {
+        res += `    .Extends<${cls.baseTypeCppFullName}>()\n`
     }
     if (cls.ctor.overloads.length == 0) {
 
@@ -111,30 +125,29 @@ PUERTS_NAMESPACE::DefineClass<${cls.fullname}>()\n`
     } else {
         res += `    .Constructor(
         CombineConstructors(\n${cls.ctor.overloads.map((ctor) => {
-            return `            MakeConstructor(${cls.fullname}${ctor.params.map(param => ', ' + param.type.cppName).join('')})`
+            return `            MakeConstructor(${cls.cppFullName}${ctor.params.map(param => ', ' + param.type.cppName).join('')})`
         }).join(",\n")}
         )
     )\n`
     }
 
-    cls.functions.forEach((overload) => {
-        const self = overload.isStatic ? "(*)" : `(${cls.fullname}::*)`
-        res += overload.isStatic ? `    .Function("${overload.name}", ` : `    .Method("${overload.name}", `
+    cls.functions.forEach((func) => {
+        const self = func.isStatic ? "(*)" : `(${cls.cppFullName}::*)`
+        res += func.isStatic ? `    .Function("${func.name}", ` : `    .Method("${func.name}", `
 
-        if (overload.overloads.length == 1) {
-            const method = overload.overloads[0];
+        if (func.overloads.length == 1) {
+            const method = func.overloads[0];
             const methodSign = `${method.returnType.cppName}${self}(${method.params.map(param => param.type.cppName).join(', ')})${method.isConst ? ' const' : ''}`;
-            res += `SelectFunction(${methodSign}, &${cls.fullname}::${method.name}${method.params
-                .map(param => renderDefaultValue(param, ', ')).filter(str => str).join('')}))\n`
+            res += `SelectFunction(${methodSign}, &${cls.cppFullName}::${method.name}${renderDefaultValues(method.params)}))\n`
 
         } else {
-            res += `CombineOverloads(${overload.overloads.map((method) => {
-                const methodSign = `${method.returnType.cppName}${self}(${method.params.map(param => {
+            res += `CombineOverloads(${func.overloads.map((overload) => {
+                const methodSign = `${overload.returnType.cppName}${self}(${overload.params.map(param => {
                     return param.type.cppName
 
-                }).join(', ')})${method.isConst ? ' const' : ''}`;
+                }).join(', ')})${overload.isConst ? ' const' : ''}`;
                 // return `\n        MakeOverload(${methodSign}, &${cls.fullname}::${method.name})`
-                return `\n        SelectOverload(${cls.fullname}_${method.name}, ${methodSign})`
+                return `\n        SelectOverload(${cls.cppFullName.replace(/::/g, "_")}_${func.index}, ${methodSign})`
             }).join(",")
                 }\n    ))\n`
         }
@@ -142,18 +155,18 @@ PUERTS_NAMESPACE::DefineClass<${cls.fullname}>()\n`
     cls.fields.forEach((field) => {
         if (field.isStatic) {
             if (field.isReadOnly) {
-                res += `    .Variable("${field.name}", MakeReadonlyVariable(&${cls.fullname}::${field.name}))\n`
+                res += `    .Variable("${field.name}", MakeReadonlyVariable(&${cls.cppFullName}::${field.name}))\n`
 
             } else {
-                res += `    .Variable("${field.name}", MakeVariable(&${cls.fullname}::${field.name}))\n`
+                res += `    .Variable("${field.name}", MakeVariable(&${cls.cppFullName}::${field.name}))\n`
             }
 
         } else {
             if (field.isReadOnly) {
-                res += `    .Property("${field.name}", MakeReadonlyProperty(&${cls.fullname}::${field.name}))\n`
+                res += `    .Property("${field.name}", MakeReadonlyProperty(&${cls.cppFullName}::${field.name}))\n`
 
             } else {
-                res += `    .Property("${field.name}", MakeProperty(&${cls.fullname}::${field.name}))\n`
+                res += `    .Property("${field.name}", MakeProperty(&${cls.cppFullName}::${field.name}))\n`
 
             }
         }
